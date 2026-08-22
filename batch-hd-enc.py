@@ -5,6 +5,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+import re
 
 # ============================================================
 # CODEC QUALITY RANKING (higher = better, for auto-selection)
@@ -29,7 +30,7 @@ LANG_ALIASES = {
 }
 
 # Bumped from 500M -> 2000M per user request (plenty of RAM available).
-# Single source of truth, used by ffprobe AND every ffmpeg pass below.
+# Used consistently for ffprobe AND both ffmpeg passes below.
 PROBE_SIZE = "2000M"
 ANALYZE_DURATION = "2000M"
 
@@ -41,6 +42,34 @@ def codec_rank(codec_name):
 def match_lang(lang_tag, target):
     """Check if a language tag matches a target language group."""
     return (lang_tag or "").lower() in LANG_ALIASES.get(target, [target])
+
+
+def get_output_dir():
+    """Prompt for an output directory, remembering the last one used."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_path = os.path.join(script_dir, ".last_output_dir")
+
+    last_used = ""
+    if os.path.exists(cache_path):
+        with open(cache_path) as f:
+            last_used = f.read().strip()
+
+    prompt = "Enter output directory"
+    prompt += f" [{last_used}]: " if last_used else ": "
+
+    user_input = input(prompt).strip().strip('"').strip("'")
+    output_dir = user_input or last_used
+
+    if not output_dir:
+        print("[ERROR] No output directory provided.")
+        sys.exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(cache_path, "w") as f:
+        f.write(output_dir)
+
+    return output_dir
 
 
 def probe_streams(input_file, stream_type, entries):
@@ -69,11 +98,6 @@ def probe_streams(input_file, stream_type, entries):
 
 
 def auto_select_audio(audio_streams):
-    """
-    Auto-select best English and best PT-BR track.
-    Prefers highest codec rank, then most channels.
-    Returns list of stream dicts for selected tracks.
-    """
     eng_candidates = [s for s in audio_streams if match_lang(s.get("lang"), "eng")]
     por_candidates = [s for s in audio_streams if match_lang(s.get("lang"), "por")]
 
@@ -108,11 +132,6 @@ def auto_select_audio(audio_streams):
 
 
 def auto_select_subtitles(sub_streams):
-    """
-    Auto-select English and PT-BR subtitle tracks.
-    Prefers Forced, then SDH/Full, skipping commentary/description tracks.
-    Returns list of stream index strings.
-    """
     skip_keywords = ["comment", "description", "director", "sdh+", "hearing impaired+"]
     selected = []
     seen_langs = {}
@@ -133,7 +152,6 @@ def auto_select_subtitles(sub_streams):
         if not candidates:
             continue
 
-        # Pick forced track if available, otherwise best scored
         forced = [s for s in candidates if "forced" in (s.get("title") or "").lower()]
         full = [s for s in candidates if "forced" not in (s.get("title") or "").lower()]
 
@@ -158,11 +176,7 @@ def auto_select_subtitles(sub_streams):
     return selected
 
 
-def build_audio_args(selected_tracks, is_4k):
-    """
-    Build ffmpeg audio map + codec args using Opus across all profiles
-    (4K, HD, and SD).
-    """
+def build_audio_args(selected_tracks):
     audio_args = []
     for i, track in enumerate(selected_tracks):
         ch = track["channels"]
@@ -190,45 +204,62 @@ def build_audio_args(selected_tracks, is_4k):
                 f"language={lang}",
             ]
         )
-        print(
-            f"  [AUDIO] Track {i + 1}: {lang_label} -> Opus {ch_label} @ {bitrate}"
-        )
+        print(f"  [AUDIO] Track {i + 1}: {lang_label} -> Opus {ch_label} @ {bitrate}")
 
     return audio_args
 
 
 def run_ffmpeg_pass(cmd, label):
-    print(f"\n--- {label} ---")
+    print(f"\n  >>> {label}")
     try:
         subprocess.run(cmd, check=True)
+        return True
     except subprocess.CalledProcessError as e:
         print(f"\n[ERROR] {label} failed with exit code: {e.returncode}")
-        sys.exit(1)
+        return False
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Error: Please drag and drop a video file onto this script.")
-        sys.exit(1)
-
-    input_file = sys.argv[1]
-    input_dir = os.path.dirname(input_file)
+def process_movie(input_file, input_dir, tmdb_token):
+    """Processes a single movie file."""
     input_base = os.path.splitext(os.path.basename(input_file))[0]
 
-    # Clean MakeMKV naming artifacts
-    movie_title = input_base.replace("_t00", "").replace("_T00", "")
+    # Clean MakeMKV naming artifacts (t001, t002, etc. case-insensitively)
+    movie_title = re.sub(r'[_.]t\d+', '', input_base, flags=re.IGNORECASE)
     movie_title = " ".join(movie_title.replace(".", " ").replace("_", " ").split())
-    cover_file = os.path.join(input_dir, "COVER.jpg")
+
+    # Give each movie its own output folder
+    movie_dir = os.path.join(input_dir, movie_title)
+    os.makedirs(movie_dir, exist_ok=True)
+
+    cover_file = os.path.join(movie_dir, f"{movie_title}.jpg")
+    output_file = os.path.join(movie_dir, f"{movie_title}.mkv")
+
+    # Temp intermediate files for the 3-pass pipeline (audio/video encoded
+    # separately so the lossless audio decoder never has to compete with
+    # SVT-AV1 for CPU time in the same process -- this is what was causing
+    # TrueHD/DTS-HD MA tracks to mute partway through the movie)
+    audio_temp_file = os.path.join(movie_dir, f".{movie_title}.audio_temp.mkv")
+    video_temp_file = os.path.join(movie_dir, f".{movie_title}.video_temp.mkv")
+
+    print("\n" + "=" * 60)
+    print(f" PROCESSING: {movie_title}")
+    print(f" Input File: {input_file}")
+    print(f" Output Dir: {movie_dir}")
+    print("=" * 60)
+
+    # Skip if output already exists to prevent losing progress on huge batches
+    if os.path.exists(output_file):
+        print(f"[SKIP] Output file already exists: {output_file}")
+        return
 
     # ============================================================
     # TMDB LOOKUP
     # ============================================================
-    tmdb_token = ""
     release_date = ""
     overview = ""
 
-    print(f"\nSearching TMDb for: '{movie_title}'...")
     if tmdb_token and tmdb_token != "PASTE_YOUR_LONG_ACCESS_TOKEN_HERE":
+        print(f"\nSearching TMDb for: '{movie_title}'...")
         try:
             url_title = urllib.parse.quote(movie_title)
             url = (
@@ -251,142 +282,72 @@ def main():
                         urllib.request.urlretrieve(poster_url, cover_file)
                     if release_date:
                         print(f"  Release Date : {release_date}")
-                    if overview:
-                        print(f"  Synopsis     : {overview[:80]}...")
         except Exception as e:
-            print(f"  [WARNING] TMDb lookup failed ({e}). Proceeding without metadata.")
+            print(f"  [WARNING] TMDb lookup failed ({e}).")
 
     # ============================================================
-    # STEP 1: CHOOSE PROFILE
+    # PROBE AUDIO
     # ============================================================
-    print("\n--------------------------------------------------")
-    print(" Select Output Profile:")
-    print("   1) 4K UHD  (_4k.mkv  — SVT-AV1 software, Opus audio)")
-    print("   2) HD 1080p (_HD.mkv  — SVT-AV1 software, Opus audio)")
-    print("   3) SD 480p  (_SD.mkv  — SVT-AV1 software, Opus audio)")
-    print("--------------------------------------------------")
-    while True:
-        video_choice = input("Choose option (1-3): ").strip()
-        if video_choice in ["1", "2", "3"]:
-            break
-        print("Invalid choice. Please enter 1, 2, or 3.")
-
-    is_4k = video_choice == "1"
-    suffix = "_4k" if video_choice == "1" else ("_HD" if video_choice == "2" else "_SD")
-    output_file = os.path.join(input_dir, f"{movie_title}{suffix}.mkv")
-
-    # Temp files for the decoupled 3-pass pipeline
-    audio_subs_temp = os.path.join(input_dir, f"{movie_title}_audio_subs_temp.mkv")
-    video_temp = os.path.join(input_dir, f"{movie_title}_video_temp.mkv")
-
-    # ============================================================
-    # STEP 2: PROBE AUDIO STREAMS
-    # ============================================================
-    print("\n--------------------------------------------------")
-    print(" Scanning audio tracks...")
-    print("--------------------------------------------------")
-
     raw_audio = probe_streams(
         input_file, "a", "stream=index,codec_name,channels:stream_tags=language,title"
     )
     if not raw_audio:
-        print("[CRITICAL] No audio tracks found. Aborting.")
-        sys.exit(1)
+        print(f"[ERROR] No audio tracks found for {movie_title}. Skipping.")
+        return
 
     audio_streams = []
-    print(" All available audio tracks:")
     for s in raw_audio:
         tags = s.get("tags", {})
         lang = (tags.get("language") or tags.get("LANGUAGE") or "unknown").lower()
         title = tags.get("title") or tags.get("TITLE") or f"Track {s['index']}"
-        codec = s.get("codec_name", "unknown")
-        channels = int(s.get("channels") or 2)
         entry = {
             "index": str(s["index"]),
-            "codec": codec,
-            "channels": channels,
+            "codec": s.get("codec_name", "unknown"),
+            "channels": int(s.get("channels") or 2),
             "lang": lang,
             "title": title,
         }
         audio_streams.append(entry)
-        print(
-            f"   Stream #0:{s['index']} [{lang.upper()}] [{channels}ch] "
-            f'({codec}) - "{title}"'
-        )
 
-    print("\n Auto-selecting best English + PT-BR tracks...")
     selected_audio = auto_select_audio(audio_streams)
-
     if not selected_audio:
-        print("[CRITICAL] No usable audio tracks selected. Aborting.")
-        sys.exit(1)
-
-    print(
-        "\n Override auto-selection? (press Enter to accept, or type track numbers e.g. '1 3')"
-    )
-    override = input(" Selection [auto]: ").strip()
-    if override:
-        manual = []
-        for tok in override.split():
-            if tok.isdigit():
-                i = int(tok) - 1
-                if 0 <= i < len(audio_streams):
-                    manual.append(audio_streams[i])
-        if manual:
-            selected_audio = manual
-            print(f" Using manual selection: {[s['index'] for s in manual]}")
+        print(f"[ERROR] No usable audio tracks selected for {movie_title}. Skipping.")
+        return
 
     # ============================================================
-    # STEP 3: PROBE SUBTITLE STREAMS
+    # PROBE SUBTITLES
     # ============================================================
-    print("\n--------------------------------------------------")
-    print(" Scanning subtitle tracks...")
-    print("--------------------------------------------------")
-
     raw_subs = probe_streams(
         input_file, "s", "stream=index,codec_name:stream_tags=language,title"
     )
-
     sub_streams = []
     if raw_subs:
-        print(" All available subtitle tracks:")
         for s in raw_subs:
             tags = s.get("tags", {})
-            lang = (tags.get("language") or tags.get("LANGUAGE") or "unknown").lower()
-            title = tags.get("title") or tags.get("TITLE") or ""
-            codec = s.get("codec_name", "unknown")
-            entry = {
-                "index": str(s["index"]),
-                "codec": codec,
-                "lang": lang,
-                "title": title,
-            }
-            sub_streams.append(entry)
-            print(f'   Stream #0:{s["index"]} [{lang.upper()}] ({codec}) - "{title}"')
-
-        print("\n Auto-selecting English + PT-BR subtitles...")
+            sub_streams.append(
+                {
+                    "index": str(s["index"]),
+                    "codec": s.get("codec_name", "unknown"),
+                    "lang": (tags.get("language") or "unknown").lower(),
+                    "title": tags.get("title") or "",
+                }
+            )
         selected_subs = auto_select_subtitles(sub_streams)
     else:
-        print(" No subtitle tracks found.")
         selected_subs = []
 
     # ============================================================
-    # BUILD PASS COMMANDS (DECOUPLED PIPELINE)
-    #
-    # Audio and video are encoded in separate ffmpeg processes so a
-    # lossless audio decode (TrueHD/DTS-HD MA) never has to compete
-    # with the video encoder for CPU time. Running both at once was
-    # causing the lossless audio decoder to lose sync partway through
-    # long files and go silent for the rest of the movie.
+    # PASS 1/3: AUDIO + SUBTITLES ONLY
+    # No video encode running here -- the lossless audio decoder
+    # (TrueHD / DTS-HD MA) gets the CPU to itself instead of fighting
+    # SVT-AV1 for scheduling, which is what caused the mid-movie mute.
     # ============================================================
-    print("\n--------------------------------------------------")
-    print(f" Building FFmpeg 3-Pass Commands for: {suffix} profile")
-    print("--------------------------------------------------")
+    print("\n  --- PASS 1/3: Encoding audio + copying subtitles ---")
 
-    # --- PASS 1: Audio + Subtitles Only ---
-    cmd1 = [
+    audio_cmd = [
         "ffmpeg",
         "-hide_banner",
+        "-y",
         "-probesize",
         PROBE_SIZE,
         "-analyzeduration",
@@ -394,63 +355,57 @@ def main():
         "-i",
         input_file,
     ]
-    print("\n Audio encoding:")
-    audio_args = build_audio_args(selected_audio, is_4k)
-    cmd1.extend(audio_args)
+
+    audio_args = build_audio_args(selected_audio)
+    audio_cmd.extend(audio_args)
 
     if selected_subs:
         for s in selected_subs:
-            cmd1.extend(["-map", f"0:{s['index']}"])
-        cmd1.extend(["-c:s", "copy"])
+            audio_cmd.extend(["-map", f"0:{s['index']}"])
+        audio_cmd.extend(["-c:s", "copy"])
     else:
-        cmd1.extend(["-map", "0:s?", "-c:s", "copy"])
-    cmd1.append(audio_subs_temp)
+        audio_cmd.extend(["-map", "0:s?", "-c:s", "copy"])
 
-    # --- PASS 2: Video Encode Only ---
-    cmd2 = [
+    audio_cmd.extend(["-ignore_unknown", audio_temp_file])
+
+    if not run_ffmpeg_pass(audio_cmd, "PASS 1 (audio + subtitles)"):
+        return
+
+    # ============================================================
+    # PASS 2/3: VIDEO ONLY
+    # No audio decode running here -- SVT-AV1 gets the CPU to itself.
+    # ============================================================
+    print("\n  --- PASS 2/3: Encoding video ---")
+
+    video_cmd = [
         "ffmpeg",
         "-hide_banner",
+        "-y",
         "-probesize",
         PROBE_SIZE,
         "-analyzeduration",
         ANALYZE_DURATION,
+        "-i",
+        input_file,
+        "-map",
+        "0:v:0",
     ]
 
-    cmd2.extend(["-i", input_file, "-map", "0:v:0"])
-
-    # SVT-AV1 software encode for all profiles (4K, HD, SD)
-    color_info = probe_streams(
-        input_file, "v:0", "stream=color_transfer,color_primaries,color_space"
-    )
+    color_info = probe_streams(input_file, "v:0", "stream=color_transfer")
     color_transfer = color_info[0].get("color_transfer", "") if color_info else ""
 
     svt_params = "tune=0"
     if color_transfer == "smpte2084":
         svt_params += ":enable-hdr=1:color-primaries=9:transfer-characteristics=16:matrix-coefficients=9"
 
-    if is_4k:
-        crf = "20"
-        profile_label = "4K"
-    elif video_choice == "2":
-        crf = "18"
-        profile_label = "HD"
-    else:
-        crf = "24"
-        profile_label = "SD"
-
-    if color_transfer == "smpte2084":
-        print(f" Video: SVT-AV1 software ({profile_label} HDR detected — enabling HDR params)")
-    else:
-        print(f" Video: SVT-AV1 software ({profile_label} SDR)")
-
-    cmd2.extend(
+    video_cmd.extend(
         [
             "-c:v",
             "libsvtav1",
             "-preset",
             "4",
             "-crf",
-            crf,
+            "18",
             "-g",
             "240",
             "-pix_fmt",
@@ -460,18 +415,33 @@ def main():
         ]
     )
 
-    cmd2.append(video_temp)
+    video_cmd.extend(["-ignore_unknown", video_temp_file])
 
-    # --- PASS 3: Remux Everything Together ---
-    # video_temp / audio_subs_temp only contain their own encoded streams,
-    # with no chapters or global metadata -- those only exist on the
-    # original file, so it's added here as a 3rd input purely to source
-    # -map_metadata / -map_chapters / attachments from.
-    comment_text = "SVT-AV1 Software 4K" if is_4k else "SVT-AV1 Software"
-    cmd3 = ["ffmpeg", "-hide_banner"]
+    if not run_ffmpeg_pass(video_cmd, "PASS 2 (video)"):
+        return
+
+    # ============================================================
+    # PASS 3/3: REMUX
+    # Combine the already-encoded video + audio/subs, add cover art,
+    # chapters, and metadata. Everything here is a stream copy, so
+    # it's fast and never touches a codec.
+    # ============================================================
+    print("\n  --- PASS 3/3: Remuxing final file ---")
+
+    remux_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-i",
+        video_temp_file,
+        "-i",
+        audio_temp_file,
+        "-i",
+        input_file,  # only used for chapters + global metadata + attachment source
+    ]
 
     if os.path.exists(cover_file):
-        cmd3.extend(
+        remux_cmd.extend(
             [
                 "-attach",
                 cover_file,
@@ -482,11 +452,14 @@ def main():
             ]
         )
 
-    cmd3.extend(["-i", video_temp, "-i", audio_subs_temp, "-i", input_file])
-    cmd3.extend(["-map", "0:v:0", "-map", "1:a", "-map", "1:s?"])
-
-    cmd3.extend(
+    remux_cmd.extend(
         [
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-map",
+            "1:s?",
             "-c",
             "copy",
             "-map_metadata",
@@ -500,7 +473,7 @@ def main():
             "-metadata",
             f"DESCRIPTION={overview}",
             "-metadata",
-            f"COMMENT=Encoded via {comment_text}",
+            "COMMENT=Encoded via SVT-AV1 Software",
             "-metadata:s:v:0",
             "language=eng",
             "-ignore_unknown",
@@ -508,41 +481,45 @@ def main():
         ]
     )
 
-    # ============================================================
-    # CONFIRM + RUN 3-PASS PIPELINE
-    # ============================================================
-    print("\n--------------------------------------------------")
-    print(f" Output file : {output_file}")
-    print(
-        f" Audio tracks: {len(selected_audio)} | Subtitle tracks: {len(selected_subs)}"
-    )
-    print("--------------------------------------------------")
-    confirm = input(" Start 3-pass encode? (y/n): ").strip().lower()
-    if confirm != "y":
-        print("Aborted.")
-        sys.exit(0)
+    if not run_ffmpeg_pass(remux_cmd, "PASS 3 (remux)"):
+        return
 
-    try:
-        run_ffmpeg_pass(cmd1, "Pass 1/3: Encoding Audio & Copying Subtitles")
-        run_ffmpeg_pass(cmd2, "Pass 2/3: Encoding Video")
-        run_ffmpeg_pass(cmd3, "Pass 3/3: Remuxing Streams & Adding Metadata")
+    # Clean up temp files
+    for f in (audio_temp_file, video_temp_file):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
-        print("\nCleaning up temporary files...")
-        for temp_f in (audio_subs_temp, video_temp):
-            if os.path.exists(temp_f):
-                os.remove(temp_f)
+    print(f"[SUCCESS] Saved: {output_file}\n")
 
-        print(f"\nDone! Successfully saved to: {output_file}")
 
-    except SystemExit:
-        # run_ffmpeg_pass already printed the error and called sys.exit(1)
-        for temp_f in (audio_subs_temp, video_temp):
-            if os.path.exists(temp_f):
-                try:
-                    os.remove(temp_f)
-                except Exception:
-                    pass
-        raise
+def main():
+    if len(sys.argv) < 2:
+        print("Error: Please drag and drop one or more video files onto this script.")
+        sys.exit(1)
+
+    # Get list of all dropped files
+    input_files = sys.argv[1:]
+
+    # Ask for output directory (remembers last-used path)
+    target_output_dir = get_output_dir()
+
+    # Optional TMDb configuration
+    tmdb_token = ""
+    print(f"Batch mode initialized. Found {len(input_files)} file(s) to process.")
+    print(f"All outputs will land in: {target_output_dir}\n")
+
+    for index, file_path in enumerate(input_files, start=1):
+        print(f"Progress: Movie {index} of {len(input_files)}")
+        if not os.path.exists(file_path):
+            print(f"[ERROR] File does not exist, skipping: {file_path}")
+            continue
+        process_movie(file_path, target_output_dir, tmdb_token)
+
+    print("\n" + "=" * 60)
+    print(" ALL BATCH JOBS COMPLETE!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
